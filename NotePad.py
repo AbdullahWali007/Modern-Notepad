@@ -2,10 +2,6 @@
 Modern Notepad - Production Ready (Enhanced, Fixed)
 A multi-tab text editor with persistent settings, undo/redo, find/replace,
 and a clean MVC architecture. Uses global AppConfig with subscription pattern.
-
-Fixes:
-- Typing speed test sample text now visible in both themes.
-- Tab title updates correctly after saving/loading files.
 """
 
 import abc
@@ -94,7 +90,6 @@ class AppConfig:
     """
     _settings_mgr = SettingsManager()
 
-    # Ensure types are concrete (fallback to defaults if None returned)
     font_family: str = _settings_mgr.get('font_family', 'Segoe UI') or 'Segoe UI'
     font_size: int = _settings_mgr.get('font_size', 12) or 12
     theme: str = _settings_mgr.get('theme', 'dark') or 'dark'
@@ -125,7 +120,7 @@ class AppConfig:
         cls._settings_mgr.set('font_size', size)
         cls._settings_mgr.set('theme', theme)
 
-        # Notify all subscribers (e.g., editor views)
+        # Notify all subscribers
         for callback in cls._subscribers:
             try:
                 callback()
@@ -168,7 +163,6 @@ class Document:
     @filepath.setter
     def filepath(self, value: Optional[Path]):
         self._filepath = value
-        # Notify observers because the tab title may change (the filename changed)
         self._notify_observers()
 
     @property
@@ -198,10 +192,9 @@ class Document:
             self._content = content
             self._filepath = filepath
             self._modified = False
-            self._notify_observers()   # notify that modified flag changed (to False)
+            self._notify_observers()
             return content
         except UnicodeDecodeError:
-            # Attempt auto-detection
             if chardet:
                 raw = filepath.read_bytes()
                 result = chardet.detect(raw)
@@ -222,7 +215,7 @@ class Document:
         try:
             self._filepath.write_text(self._content, encoding='utf-8')
             self._modified = False
-            self._notify_observers()   # notify that modified flag changed to False
+            self._notify_observers()
             return True
         except Exception as e:
             logger.error(f"Failed to save file: {e}")
@@ -239,8 +232,8 @@ class TextEditorView(ctk.CTkFrame):
         self._redraw_timer = None
         self.tab_update_callback: Optional[Callable[[], None]] = None
 
-        # Line numbers canvas
-        self.line_numbers = tk.Canvas(self, width=40, bg='#1a1a1a', highlightthickness=0)
+        # Line numbers canvas - width will be updated dynamically
+        self.line_numbers = tk.Canvas(self, bg='#1a1a1a', highlightthickness=0)
         self.line_numbers.pack(side=tk.LEFT, fill=tk.Y)
 
         # Text area
@@ -255,6 +248,10 @@ class TextEditorView(ctk.CTkFrame):
 
         self._tk_text = self.text_area._textbox
         self._tk_text.configure(insertbackground='white', selectbackground='#3e3e3e')
+
+        # Find/Replace highlight tags
+        self._tk_text.tag_configure("find_highlight", background="#ffff00" if AppConfig.theme == "light" else "#4a4a00")
+        self._tk_text.tag_configure("find_current", background="#ff9632" if AppConfig.theme == "light" else "#b85900")
 
         # Bind events
         self._tk_text.bind("<KeyRelease>", self._on_key_release)
@@ -273,7 +270,20 @@ class TextEditorView(ctk.CTkFrame):
         self._set_text(self.document.content)
 
     def destroy(self):
+        # Clean up timers and unbind events to prevent Tcl/Tk crashes
+        if self._redraw_timer:
+            self.after_cancel(self._redraw_timer)
+            self._redraw_timer = None
         AppConfig.unsubscribe(self._apply_config)
+        # Unbind all events from _tk_text
+        for event in ("<KeyRelease>", "<MouseWheel>", "<Button-1>", "<Configure>"):
+            try:
+                self._tk_text.unbind(event)
+            except tk.TclError:
+                pass
+        # Destroy the text widget and canvas explicitly
+        self.text_area.destroy()
+        self.line_numbers.destroy()
         super().destroy()
 
     # ---------- Configuration ----------
@@ -284,13 +294,31 @@ class TextEditorView(ctk.CTkFrame):
             self.text_area.configure(fg_color='#242424', text_color='#ffffff')
             self._tk_text.configure(insertbackground='white', selectbackground='#3e3e3e')
             self.line_numbers.config(bg='#1a1a1a')
+            self._tk_text.tag_configure("find_highlight", background="#4a4a00")
+            self._tk_text.tag_configure("find_current", background="#b85900")
         else:
             self.text_area.configure(fg_color='#ffffff', text_color='#000000')
             self._tk_text.configure(insertbackground='black', selectbackground='#d4d4d4')
             self.line_numbers.config(bg='#f0f0f0')
+            self._tk_text.tag_configure("find_highlight", background="#ffff00")
+            self._tk_text.tag_configure("find_current", background="#ff9632")
+        self._update_line_numbers_width()
         self._schedule_redraw()
 
     # ---------- Line Numbers ----------
+    def _update_line_numbers_width(self):
+        """Adjust canvas width based on number of lines and font size."""
+        font = self.text_area.cget("font")
+        try:
+            line_count = int(self._tk_text.index("end-1c").split(".")[0])
+        except tk.TclError:
+            line_count = 1
+        sample = str(line_count)
+        tk_font = tkfont.Font(font=font)
+        width = tk_font.measure(sample) + 15
+        width = max(width, 30)
+        self.line_numbers.config(width=width)
+
     def _schedule_redraw(self, event=None):
         if self._redraw_timer:
             self.after_cancel(self._redraw_timer)
@@ -298,9 +326,12 @@ class TextEditorView(ctk.CTkFrame):
 
     def _draw_line_numbers(self):
         self.line_numbers.delete("all")
+        if not self._tk_text.winfo_exists():
+            return
         i = self._tk_text.index("@0,0")
         text_color = "#666666" if AppConfig.theme == "light" else "#888888"
         font = self.text_area.cget("font")
+        canvas_width = self.line_numbers.winfo_width()
 
         while True:
             dline = self._tk_text.dlineinfo(i)
@@ -308,8 +339,13 @@ class TextEditorView(ctk.CTkFrame):
                 break
             y = dline[1]
             linenum = i.split(".")[0]
-            self.line_numbers.create_text(35, y, anchor="ne", text=linenum, fill=text_color, font=font)
+            self.line_numbers.create_text(
+                canvas_width - 5, y,
+                anchor="ne", text=linenum,
+                fill=text_color, font=font
+            )
             i = self._tk_text.index(f"{i}+1line")
+        self._redraw_timer = None
 
     # ---------- Content & Modification ----------
     def _on_key_release(self, event=None):
@@ -318,34 +354,44 @@ class TextEditorView(ctk.CTkFrame):
                        "Control_L", "Control_R", "Alt_L", "Alt_R", "Caps_Lock"}
         if event and event.keysym not in ignore_keys:
             self.document.content = self._get_text()
+            # If a find dialog is open, we might want to refresh highlights
+            self._refresh_find_highlights()
+
+    def _refresh_find_highlights(self):
+        """Called when content changes; informs the find dialog to update."""
+        # We'll use a global reference if needed; for now, we'll let the find dialog handle it.
+        pass
 
     def _on_document_modified(self):
-        if hasattr(self, 'tab_update_callback') and self.tab_update_callback:
+        if self.tab_update_callback:
             self.tab_update_callback()
 
     def _get_text(self) -> str:
         return self.text_area.get("1.0", "end-1c")
 
-    def _set_text(self, text: str):
+    def _set_text(self, text: str, reset_undo: bool = True):
+        """Replace entire content and optionally reset the undo stack."""
         self.text_area.delete("1.0", tk.END)
         self.text_area.insert("1.0", text)
+        if reset_undo:
+            self._tk_text.edit_reset()  # Makes the current state the base for undo
         self._schedule_redraw()
 
     def get_text(self) -> str:
         return self._get_text()
 
     def set_text(self, text: str):
-        self._set_text(text)
+        self._set_text(text, reset_undo=True)
         self.document.content = text
 
     def clear(self):
-        self._set_text("")
+        self._set_text("", reset_undo=True)
         self.document.content = ""
 
     def load_from_file(self, filepath: Path) -> bool:
         try:
             content = self.document.load_from_file(filepath)
-            self._set_text(content)
+            self._set_text(content, reset_undo=True)
             return True
         except Exception as e:
             messagebox.showerror("Open Error", f"Failed to open file:\n{str(e)}")
@@ -361,6 +407,120 @@ class TextEditorView(ctk.CTkFrame):
 
     def focus(self):
         self.text_area.focus_set()
+
+    # ---------- Find / Replace helpers ----------
+    def clear_find_highlights(self):
+        """Remove all find-related tags."""
+        self._tk_text.tag_remove("find_highlight", "1.0", tk.END)
+        self._tk_text.tag_remove("find_current", "1.0", tk.END)
+
+    def highlight_all(self, pattern, case_sensitive=False, whole_word=False, regex=False):
+        """Highlight all matches of pattern in the text.
+        Returns the number of matches found.
+        """
+        self.clear_find_highlights()
+        matches = self._get_matches(pattern, case_sensitive, whole_word, regex)
+        for start, end in matches:
+            self._tk_text.tag_add("find_highlight", f"1.0+{start}c", f"1.0+{end}c")
+        return len(matches)
+
+    def find_next(self, pattern, case_sensitive=False, whole_word=False, regex=False):
+        """Find next occurrence and highlight it, return (start_index, end_index) or None."""
+        start = self._tk_text.index(tk.INSERT)
+        if self._tk_text.tag_ranges(tk.SEL):
+            start = self._tk_text.index(tk.SEL_LAST)
+
+        if regex:
+            # Use _get_matches to get all matches and find the first one after cursor
+            matches = self._get_matches(pattern, case_sensitive, whole_word, regex)
+            for match_start, match_end in matches:
+                tk_start = f"1.0+{match_start}c"
+                if self._tk_text.compare(tk_start, ">=", start):
+                    self._select_and_highlight(match_start, match_end)
+                    return (match_start, match_end)
+            # If none found after cursor, wrap to start
+            for match_start, match_end in matches:
+                tk_start = f"1.0+{match_start}c"
+                if self._tk_text.compare(tk_start, ">=", "1.0"):
+                    self._select_and_highlight(match_start, match_end)
+                    return (match_start, match_end)
+            return None
+        else:
+            # Plain text search (incremental)
+            query = pattern
+            if not query:
+                return None
+            pos = self._tk_text.search(query, start, stopindex=tk.END,
+                                       nocase=not case_sensitive, regexp=False)
+            if pos:
+                end = f"{pos}+{len(query)}c"
+                if whole_word:
+                    # Check boundaries
+                    before = self._tk_text.get(f"{pos}-1c", pos)
+                    after = self._tk_text.get(end, f"{end}+1c")
+                    if (before and before.isalnum()) or (after and after.isalnum()):
+                        # Not a whole word, continue search from end
+                        self._tk_text.mark_set(tk.INSERT, end)
+                        return self.find_next(pattern, case_sensitive, whole_word, regex)
+                self._select_and_highlight_pos(pos, end)
+                return (pos, end)
+            return None
+
+    def _select_and_highlight(self, start_offset, end_offset):
+        start = f"1.0+{start_offset}c"
+        end = f"1.0+{end_offset}c"
+        self._select_and_highlight_pos(start, end)
+
+    def _select_and_highlight_pos(self, start, end):
+        self._tk_text.tag_remove("find_current", "1.0", tk.END)
+        self._tk_text.tag_add("find_current", start, end)
+        self._tk_text.tag_add(tk.SEL, start, end)
+        self._tk_text.mark_set(tk.INSERT, end)
+        self._tk_text.see(tk.INSERT)
+
+    def _get_matches(self, pattern, case_sensitive, whole_word, regex):
+        """Return list of (start, end) offsets for all matches.
+        Handles whole_word for both plain text and regex by checking boundaries.
+        """
+        content = self._get_text()
+        if not content or not pattern:
+            return []
+
+        if regex:
+            flags = 0 if case_sensitive else re.IGNORECASE
+            try:
+                compiled = re.compile(pattern, flags)
+                matches = [(m.start(), m.end()) for m in compiled.finditer(content)]
+            except re.error:
+                return []
+        else:
+            query = pattern
+            if not case_sensitive:
+                query = query.lower()
+                content_lower = content.lower()
+            else:
+                content_lower = content
+            matches = []
+            start = 0
+            while True:
+                pos = content_lower.find(query, start)
+                if pos == -1:
+                    break
+                end = pos + len(query)
+                matches.append((pos, end))
+                start = end
+
+        # Apply whole-word filtering if required
+        if whole_word:
+            filtered = []
+            for start, end in matches:
+                # Check boundaries
+                before = content[start-1] if start > 0 else ''
+                after = content[end] if end < len(content) else ''
+                if (not before.isalnum()) and (not after.isalnum()):
+                    filtered.append((start, end))
+            return filtered
+        return matches
 
 
 # ---------------------------- View: Tab Panel ----------------------------
@@ -394,26 +554,34 @@ class TabbedPanel(ctk.CTkFrame):
 
     def remove_tab(self, view: ctk.CTkFrame):
         if view in self._views:
-            index = self._views.index(view)
-            self.notebook.forget(index)
+            try:
+                idx = self.notebook.index(view)
+            except tk.TclError:
+                idx = None
+            if idx is not None:
+                self.notebook.forget(idx)
             self._views.remove(view)
             view.destroy()
 
     def get_current_tab(self):
         try:
-            idx = self.notebook.index("current")
-            return self._views[idx]
-        except (IndexError, tk.TclError):
+            current_widget = self.notebook.select()
+            if not current_widget:
+                return None
+            for view in self._views:
+                if str(view) == current_widget:
+                    return view
+            return None
+        except tk.TclError:
             return None
 
     def _update_tab_title(self, view: TextEditorView):
         try:
-            idx = self._views.index(view)
             title = view.document.filepath.name if view.document.filepath else "New Tab"
             if view.document.modified:
                 title += " *"
-            self.notebook.tab(idx, text=title)
-        except ValueError:
+            self.notebook.tab(view, text=title)
+        except tk.TclError:
             pass
 
 
@@ -427,30 +595,32 @@ class SettingsView(ctk.CTkFrame):
         inner = ctk.CTkFrame(self, corner_radius=10, fg_color="#242424")
         inner.pack(pady=40, padx=40, fill=tk.BOTH, expand=True)
 
-        # Font Family
         ctk.CTkLabel(inner, text="Font Family:", font=("Segoe UI", 14)).grid(row=0, column=0, sticky="w", padx=20, pady=(20,10))
         self.font_family_var = ctk.StringVar(value=AppConfig.font_family)
         ctk.CTkOptionMenu(inner, variable=self.font_family_var,
                           values=["Segoe UI", "Arial", "Courier New", "Times New Roman", "Consolas"]).grid(row=0, column=1, sticky="ew", padx=20, pady=(20,10))
 
-        # Font Size
         ctk.CTkLabel(inner, text="Font Size:", font=("Segoe UI", 14)).grid(row=1, column=0, sticky="w", padx=20, pady=10)
         self.font_size_var = ctk.StringVar(value=str(AppConfig.font_size))
         ctk.CTkOptionMenu(inner, variable=self.font_size_var,
                           values=["8","10","12","14","16","18","20","24","28","36"]).grid(row=1, column=1, sticky="ew", padx=20, pady=10)
 
-        # Theme
         ctk.CTkLabel(inner, text="Theme:", font=("Segoe UI", 14)).grid(row=2, column=0, sticky="w", padx=20, pady=10)
         self.theme_var = ctk.StringVar(value=AppConfig.theme.capitalize())
         ctk.CTkOptionMenu(inner, variable=self.theme_var, values=["Dark", "Light"]).grid(row=2, column=1, sticky="ew", padx=20, pady=10)
 
-        # Apply Button
         ctk.CTkButton(inner, text="Apply Settings", command=self._apply, height=35).grid(row=3, column=0, columnspan=2, pady=30)
         inner.columnconfigure(1, weight=1)
 
     def _apply(self):
         family = self.font_family_var.get()
-        size = int(self.font_size_var.get())
+        try:
+            size = int(self.font_size_var.get())
+            if size < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Font size must be a positive integer.")
+            return
         theme = self.theme_var.get().lower()
         AppConfig.update_settings(family, size, theme)
 
@@ -462,15 +632,236 @@ class AboutView(ctk.CTkFrame):
         inner = ctk.CTkFrame(self, corner_radius=10, fg_color="#242424")
         inner.pack(pady=40, padx=40, fill=tk.BOTH, expand=True)
         ctk.CTkLabel(inner, text="Modern Notepad", font=("Segoe UI", 24, "bold")).pack(pady=(30,10))
-        ctk.CTkLabel(inner, text="Version 3.1\n\nA modern text editor with persistent settings,\nundo/redo, line numbers, and a clean architecture.\n\nBuilt with Python and CustomTkinter",
+        ctk.CTkLabel(inner, text="Version 3.2\n\nA modern text editor with persistent settings,\nundo/redo, line numbers, and a clean architecture.\n\nBuilt with Python and CustomTkinter",
                      font=("Segoe UI", 14), justify="center").pack(pady=10)
         ctk.CTkLabel(inner, text="© 2026 M. Abdullah Wali", font=("Segoe UI", 12), text_color="gray").pack(pady=30)
+
+
+# ---------------------------- View: Find/Replace Dialog ----------------------------
+class FindReplaceDialog(ctk.CTkToplevel):
+    """Modeless find/replace dialog with VS Code style features."""
+
+    def __init__(self, master, editor: TextEditorView):
+        super().__init__(master)
+        self.editor = editor
+        self.title("Find and Replace")
+        self.geometry("500x200")
+        self.resizable(False, False)
+        self.transient(master)
+        self.attributes('-topmost', True)
+        if pywinstyles:
+            try:
+                pywinstyles.apply_style(self, "mica")
+            except:
+                pass
+
+        self.case_sensitive = tk.BooleanVar(value=False)
+        self.whole_word = tk.BooleanVar(value=False)
+        self.use_regex = tk.BooleanVar(value=False)
+
+        self._create_widgets()
+        self._bind_shortcuts()
+        self._update_highlights()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _create_widgets(self):
+        main_frame = ctk.CTkFrame(self, fg_color="transparent")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Find row
+        find_label = ctk.CTkLabel(main_frame, text="Find:", font=("Segoe UI", 12))
+        find_label.grid(row=0, column=0, sticky="w", padx=(0,5), pady=5)
+        self.find_entry = ctk.CTkEntry(main_frame, width=300)
+        self.find_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
+        self.find_entry.bind("<KeyRelease>", self._on_find_change)
+
+        # Replace row
+        replace_label = ctk.CTkLabel(main_frame, text="Replace:", font=("Segoe UI", 12))
+        replace_label.grid(row=1, column=0, sticky="w", padx=(0,5), pady=5)
+        self.replace_entry = ctk.CTkEntry(main_frame, width=300)
+        self.replace_entry.grid(row=1, column=1, columnspan=3, sticky="ew", padx=5, pady=5)
+
+        # Buttons row
+        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        btn_frame.grid(row=2, column=0, columnspan=4, pady=10, sticky="ew")
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+        btn_frame.columnconfigure(3, weight=1)
+
+        ctk.CTkButton(btn_frame, text="Find Next", command=self._find_next, width=90).grid(row=0, column=0, padx=2)
+        ctk.CTkButton(btn_frame, text="Find Prev", command=self._find_prev, width=90).grid(row=0, column=1, padx=2)
+        ctk.CTkButton(btn_frame, text="Replace", command=self._replace, width=90).grid(row=0, column=2, padx=2)
+        ctk.CTkButton(btn_frame, text="Replace All", command=self._replace_all, width=90).grid(row=0, column=3, padx=2)
+
+        # Options row
+        opt_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
+        opt_frame.grid(row=3, column=0, columnspan=4, pady=5, sticky="w")
+        ctk.CTkCheckBox(opt_frame, text="Match Case", variable=self.case_sensitive, command=self._update_highlights).pack(side=tk.LEFT, padx=5)
+        ctk.CTkCheckBox(opt_frame, text="Whole Word", variable=self.whole_word, command=self._update_highlights).pack(side=tk.LEFT, padx=5)
+        ctk.CTkCheckBox(opt_frame, text="Regex", variable=self.use_regex, command=self._update_highlights).pack(side=tk.LEFT, padx=5)
+
+        # Status label (match count)
+        self.status_label = ctk.CTkLabel(main_frame, text="", font=("Segoe UI", 10))
+        self.status_label.grid(row=4, column=0, columnspan=4, sticky="w", pady=2)
+
+        # Configure column weights
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.columnconfigure(2, weight=1)
+
+    def _bind_shortcuts(self):
+        self.bind("<Return>", lambda e: self._find_next())
+        self.bind("<Shift-Return>", lambda e: self._find_prev())
+        self.find_entry.bind("<Control-a>", lambda e: self.find_entry.select_range(0, tk.END))
+        self.replace_entry.bind("<Control-a>", lambda e: self.replace_entry.select_range(0, tk.END))
+
+    def _on_find_change(self, event=None):
+        self._update_highlights()
+
+    def _update_highlights(self):
+        """Update all highlights and status."""
+        if not self.editor:
+            return
+        pattern = self.find_entry.get()
+        if not pattern:
+            self.editor.clear_find_highlights()
+            self.status_label.configure(text="")
+            return
+        case = self.case_sensitive.get()
+        whole = self.whole_word.get()
+        regex = self.use_regex.get()
+        count = self.editor.highlight_all(pattern, case, whole, regex)
+        self.status_label.configure(text=f"{count} match(es)")
+
+    def _find_next(self):
+        if not self.editor:
+            return
+        pattern = self.find_entry.get()
+        if not pattern:
+            return
+        case = self.case_sensitive.get()
+        whole = self.whole_word.get()
+        regex = self.use_regex.get()
+        result = self.editor.find_next(pattern, case, whole, regex)
+        if result is None:
+            # Wrap around?
+            # Go to start and try again
+            self.editor._tk_text.mark_set(tk.INSERT, "1.0")
+            result = self.editor.find_next(pattern, case, whole, regex)
+            if result is None:
+                self.status_label.configure(text="No more matches")
+                return
+        # Update status
+        self._update_highlights()  # refresh count
+
+    def _find_prev(self):
+        if not self.editor:
+            return
+        pattern = self.find_entry.get()
+        if not pattern:
+            return
+        case = self.case_sensitive.get()
+        whole = self.whole_word.get()
+        regex = self.use_regex.get()
+        matches = self.editor._get_matches(pattern, case, whole, regex)
+        if not matches:
+            self.status_label.configure(text="No matches")
+            return
+        cursor = self.editor._tk_text.index(tk.INSERT)
+        # Find the match with largest start < cursor
+        selected_match = None
+        for start, end in matches:
+            tk_start = f"1.0+{start}c"
+            if self.editor._tk_text.compare(tk_start, "<", cursor):
+                selected_match = (start, end)
+        if selected_match is None:
+            # Wrap to end (take last match)
+            if matches:
+                selected_match = matches[-1]
+        if selected_match:
+            self.editor._select_and_highlight(selected_match[0], selected_match[1])
+            self.editor._tk_text.mark_set(tk.INSERT, f"1.0+{selected_match[0]}c")
+            self.editor._tk_text.see(tk.INSERT)
+            self._update_highlights()
+
+    def _replace(self):
+        if not self.editor:
+            return
+        pattern = self.find_entry.get()
+        if not pattern:
+            return
+        replacement = self.replace_entry.get()
+        case = self.case_sensitive.get()
+        whole = self.whole_word.get()
+        regex = self.use_regex.get()
+
+        # Check if there is a selection and it matches the current find pattern
+        if self.editor._tk_text.tag_ranges(tk.SEL):
+            sel_start = self.editor._tk_text.index(tk.SEL_FIRST)
+            sel_end = self.editor._tk_text.index(tk.SEL_LAST)
+            matches = self.editor._get_matches(pattern, case, whole, regex)
+            for match_start, match_end in matches:
+                tk_start = f"1.0+{match_start}c"
+                tk_end = f"1.0+{match_end}c"
+                if self.editor._tk_text.compare(tk_start, "==", sel_start) and self.editor._tk_text.compare(tk_end, "==", sel_end):
+                    # Replace the selection
+                    self.editor._tk_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+                    self.editor._tk_text.insert(tk.INSERT, replacement)
+                    # Sync document content
+                    self.editor.document.content = self.editor._get_text()
+                    self._update_highlights()
+                    return
+        # If no matching selection, do find next and then replace
+        self._find_next()
+        if self.editor._tk_text.tag_ranges(tk.SEL):
+            self.editor._tk_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            self.editor._tk_text.insert(tk.INSERT, replacement)
+            self.editor.document.content = self.editor._get_text()
+            self._update_highlights()
+
+    def _replace_all(self):
+        if not self.editor:
+            return
+        pattern = self.find_entry.get()
+        if not pattern:
+            return
+        replacement = self.replace_entry.get()
+        case = self.case_sensitive.get()
+        whole = self.whole_word.get()
+        regex = self.use_regex.get()
+
+        content = self.editor._get_text()
+        if not content:
+            return
+
+        matches = self.editor._get_matches(pattern, case, whole, regex)
+        if not matches:
+            self.status_label.configure(text="No matches to replace")
+            return
+
+        # Replace from end to start to avoid offset shifting
+        new_content = content
+        offset = 0
+        for start, end in matches:
+            actual_start = start + offset
+            actual_end = end + offset
+            new_content = new_content[:actual_start] + replacement + new_content[actual_end:]
+            offset += len(replacement) - (end - start)
+
+        if new_content != content:
+            self.editor.set_text(new_content)
+            self._update_highlights()
+            self.status_label.configure(text=f"Replaced {len(matches)} occurrence(s)")
+
+    def _on_close(self):
+        if self.editor:
+            self.editor.clear_find_highlights()
+        self.destroy()
 
 
 # ---------------------------- Controller: ModernNotepad ----------------------------
 class ModernNotepad:
     def __init__(self):
-        # Load saved config
         AppConfig.load()
 
         self.root = ctk.CTk()
@@ -507,6 +898,7 @@ class ModernNotepad:
         self._bind_shortcuts()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self._find_dialog = None  # reference to find dialog
 
     # ---------- UI Creation ----------
     def _create_menu(self):
@@ -627,7 +1019,10 @@ class ModernNotepad:
             self._new_tab()
 
     def _on_closing(self):
-        for view in self.tab_panel._views:
+        AppConfig._settings_mgr.set('window_width', self.root.winfo_width())
+        AppConfig._settings_mgr.set('window_height', self.root.winfo_height())
+
+        for view in self.tab_panel._views[:]:
             if isinstance(view, TextEditorView) and view.document.modified:
                 self.tab_panel.notebook.select(view)
                 name = view.document.filepath.name if view.document.filepath else "New Tab"
@@ -637,9 +1032,6 @@ class ModernNotepad:
                         return
                 elif response is None:
                     return
-        # Save window geometry
-        AppConfig._settings_mgr.set('window_width', self.root.winfo_width())
-        AppConfig._settings_mgr.set('window_height', self.root.winfo_height())
         self.root.destroy()
 
     # ---------- File Operations ----------
@@ -741,99 +1133,13 @@ class ModernNotepad:
         if not editor:
             messagebox.showinfo("Info", "Open an editor tab first.")
             return
-
-        win = ctk.CTkToplevel(self.root)
-        win.title("Find and Replace")
-        win.geometry("450x240")
-        win.transient(self.root)
-        win.attributes('-topmost', True)
-        win.grab_set()
-        win.focus_force()
-        if pywinstyles:
-            try: pywinstyles.apply_style(win, "mica")
-            except: pass
-
-        case_sensitive = tk.BooleanVar(value=False)
-
-        ctk.CTkLabel(win, text="Find:").grid(row=0, column=0, padx=20, pady=(20,5), sticky="w")
-        find_entry = ctk.CTkEntry(win, width=250)
-        find_entry.grid(row=0, column=1, padx=10, pady=(20,5), sticky="ew")
-
-        ctk.CTkLabel(win, text="Replace:").grid(row=1, column=0, padx=20, pady=5, sticky="w")
-        replace_entry = ctk.CTkEntry(win, width=250)
-        replace_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
-
-        ctk.CTkCheckBox(win, text="Case sensitive", variable=case_sensitive).grid(row=2, column=0, columnspan=2, pady=5)
-
-        btn_frame = ctk.CTkFrame(win, fg_color="transparent")
-        btn_frame.grid(row=3, column=0, columnspan=2, pady=10)
-
-        def find_next():
-            ed = self._get_current_editor()
-            if not ed: return
-            query = find_entry.get()
-            if not query: return
-            start = ed._tk_text.index(tk.INSERT)
-            if ed._tk_text.tag_ranges(tk.SEL):
-                start = ed._tk_text.index(tk.SEL_LAST)
-            pos = ed._tk_text.search(query, start, stopindex=tk.END, nocase=not case_sensitive.get())
-            if pos:
-                end = f"{pos}+{len(query)}c"
-                ed._tk_text.tag_remove(tk.SEL, "1.0", tk.END)
-                ed._tk_text.tag_add(tk.SEL, pos, end)
-                ed._tk_text.mark_set(tk.INSERT, end)
-                ed._tk_text.see(tk.INSERT)
-                ed.focus()
-            else:
-                messagebox.showinfo("Find", "No more occurrences.")
-
-        def replace_one():
-            ed = self._get_current_editor()
-            if not ed: return
-            query = find_entry.get()
-            if not query: return
-            replacement = replace_entry.get()
-            # Replace only if selection matches query
-            if ed._tk_text.tag_ranges(tk.SEL):
-                sel = ed._tk_text.get(tk.SEL_FIRST, tk.SEL_LAST)
-                if sel == query:
-                    ed._tk_text.delete(tk.SEL_FIRST, tk.SEL_LAST)
-                    ed._tk_text.insert(tk.INSERT, replacement)
-                    ed.document.modified = True
-                    # Move cursor after replacement
-                    ed._tk_text.mark_set(tk.INSERT, f"{tk.INSERT}+{len(replacement)}c")
-                    ed._tk_text.tag_add(tk.SEL, f"{tk.INSERT}-{len(replacement)}c", tk.INSERT)
-                    ed._tk_text.see(tk.INSERT)
-                    ed.focus()
-                    return
-            # Otherwise find next
-            find_next()
-
-        def replace_all():
-            ed = self._get_current_editor()
-            if not ed: return
-            query = find_entry.get()
-            if not query: return
-            replacement = replace_entry.get()
-            content = ed.get_text()
-            # Use case-insensitive if not case_sensitive
-            if not case_sensitive.get():
-                # Use regex with IGNORECASE
-                pattern = re.compile(re.escape(query), re.IGNORECASE)
-                new_content = pattern.sub(replacement, content)
-            else:
-                new_content = content.replace(query, replacement)
-            if content != new_content:
-                ed.set_text(new_content)
-                ed.document.modified = True
-            ed._tk_text.tag_remove(tk.SEL, "1.0", tk.END)
-
-        ctk.CTkButton(btn_frame, text="Find Next", width=90, command=find_next).pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Replace", width=90, command=replace_one).pack(side=tk.LEFT, padx=5)
-        ctk.CTkButton(btn_frame, text="Replace All", width=90, command=replace_all).pack(side=tk.LEFT, padx=5)
-
-        win.columnconfigure(1, weight=1)
-        find_entry.focus_set()
+        # If dialog already exists, bring it to front
+        if self._find_dialog is not None and self._find_dialog.winfo_exists():
+            self._find_dialog.lift()
+            self._find_dialog.focus_force()
+            return
+        self._find_dialog = FindReplaceDialog(self.root, editor)
+        self._find_dialog.focus_force()
 
     # ---------- Typing Speed Test ----------
     def _show_typing_speed(self):
@@ -845,8 +1151,10 @@ class ModernNotepad:
         win.grab_set()
         win.focus_force()
         if pywinstyles:
-            try: pywinstyles.apply_style(win, "mica")
-            except: pass
+            try:
+                pywinstyles.apply_style(win, "mica")
+            except:
+                pass
 
         main = ctk.CTkFrame(win, fg_color="transparent")
         main.pack(fill=tk.BOTH, expand=True, padx=30, pady=30)
@@ -858,25 +1166,17 @@ class ModernNotepad:
                   "for modern software development. Practice consistently to improve "
                   "your speed and accuracy.")
 
-# Choose text color based on current theme
         sample_color = "#dddddd" if AppConfig.theme == "dark" else "#333333"
-        
-        # 1. Initialize the textbox WITHOUT the disabled state
         sample_disp = ctk.CTkTextbox(
-            main, 
-            height=80, 
-            wrap=tk.WORD, 
+            main,
+            height=80,
+            wrap=tk.WORD,
             font=("Segoe UI", 14),
-            fg_color="transparent", 
+            fg_color="transparent",
             text_color=sample_color
         )
-        
-        # 2. Insert the sample text while the widget is still editable
         sample_disp.insert("1.0", sample)
-        
-        # 3. Disable the widget so the user can't modify the sample text
         sample_disp.configure(state=tk.DISABLED)
-        
         sample_disp.pack(fill=tk.X, pady=(0,15))
 
         stats = ctk.CTkFrame(main, fg_color="#242424", corner_radius=10)
@@ -916,7 +1216,6 @@ class ModernNotepad:
             typed = input_area.get("1.0", "end-1c")
             typed_len = len(typed)
 
-            # Prevent typing beyond sample length
             if typed_len > len(sample):
                 input_area.delete("end-2c", tk.END)
                 return
@@ -947,8 +1246,6 @@ class ModernNotepad:
                     win.after_cancel(state['timer_id'])
                     state['timer_id'] = None
                 input_area.configure(state=tk.DISABLED)
-                # Final accuracy
-                correct = sum(1 for i, c in enumerate(typed) if i < len(sample) and c == sample[i])
                 final_acc = (correct / len(sample)) * 100
                 acc_var.set(f"Accuracy: {int(final_acc)}%")
 
@@ -982,8 +1279,10 @@ class ModernNotepad:
         win.grab_set()
         win.focus_force()
         if pywinstyles:
-            try: pywinstyles.apply_style(win, "mica")
-            except: pass
+            try:
+                pywinstyles.apply_style(win, "mica")
+            except:
+                pass
         about = AboutView(win)
         about.pack(fill=tk.BOTH, expand=True)
         ctk.CTkButton(win, text="Close", command=win.destroy, width=100).pack(pady=(0,20))
